@@ -1,20 +1,34 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useMemo, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 import { GoogleGenAI, Type } from "@google/genai";
 
-// --- Configuration & Constants ---
-const API_KEY = process.env.API_KEY;
+// --- 1. CONFIG & STYLES (Separation of Concerns) ---
 const THEME = {
   primary: '#128C7E',
   secondary: '#25D366',
-  bg: '#f0f2f5',
+  bg: '#eef1f4',
   card: '#ffffff',
   text: '#111b21',
   subtext: '#667781',
+  danger: '#ef5350',
   userColors: ['#DCF8C6', '#E1F5FE', '#FFF9C4', '#F8BBD0', '#E0F2F1', '#D1C4E9', '#FFCCBC', '#B2DFDB', '#FFECB3']
 };
 
-// --- Types ---
+// Estilos extraídos para limpiar el JSX (CSS-in-JS "lite")
+const styles = {
+  container: { maxWidth: '1200px', margin: '0 auto', padding: '2rem', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif' },
+  card: { background: THEME.card, padding: '1.5rem', borderRadius: '1rem', boxShadow: '0 4px 12px rgba(0,0,0,0.05)', transition: 'transform 0.2s' },
+  header: { textAlign: 'center' as const, marginBottom: '3rem' },
+  grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '1.5rem' },
+  flexCenter: { display: 'flex', justifyContent: 'center', alignItems: 'center' },
+  uploadBox: (isDragging: boolean, error: boolean) => ({
+    border: `2px dashed ${error ? THEME.danger : (isDragging ? THEME.secondary : '#cbd5e0')}`,
+    borderRadius: '1rem', padding: '3rem', textAlign: 'center' as const,
+    backgroundColor: isDragging ? '#e8f5e9' : 'white', cursor: 'pointer', transition: 'all 0.3s ease'
+  })
+};
+
+// --- 2. TYPES ---
 interface Message {
   date: Date;
   author: string;
@@ -25,12 +39,12 @@ interface AnalysisStats {
   totalMessages: number;
   authorCounts: Record<string, number>;
   wordCounts: Record<string, number>;
-  authorWordCounts: Record<string, Record<string, number>>; // New: Words per author
-  emojiCounts: Record<string, number>; // New: Emojis
-  hourlyActivity: Record<number, number>; 
-  dailyActivity: Record<number, number>; 
-  dailyVolume: Record<string, number>; // New: Timeline data (YYYY-MM-DD -> count)
-  busiestDay: { date: string; count: number }; // New: Peak day
+  authorWordCounts: Record<string, Record<string, number>>;
+  emojiCounts: Record<string, number>;
+  hourlyActivity: Record<number, number>;
+  dailyActivity: Record<number, number>; // 0-6 (Domingo-Sabado)
+  dailyVolume: Record<string, number>;
+  busiestDay: { date: string; count: number };
   participants: string[];
   dateRange: { start: Date; end: Date };
 }
@@ -40,233 +54,217 @@ interface AIAnalysisResult {
   qa: { question: string; answer: string }[];
 }
 
-// --- Helpers ---
-const STOP_WORDS = new Set(['de', 'la', 'que', 'el', 'en', 'y', 'a', 'los', 'se', 'del', 'las', 'un', 'por', 'con', 'no', 'una', 'su', 
-'para', 'es', 'al', 'lo', 'como', 'más', 'o', 'pero', 'sus', 'le', 'ha', 'me', 'si', 'sin', 'sobre', 'este', 'ya', 'entre', 'cuando', 
-'todo', 'esta', 'ser', 'son', 'dos', 'también', 'fue', 'había', 'era', 'muy', 'años', 'hasta', 'desde', 'está', 'mi', 'porque', 'qué', 
-'solo', 'han', 'yo', 'hay', 'vez', 'puede', 'todos', 'así', 'nos', 'ni', 'parte', 'tiene', 'él', 'uno', 'donde', 'bien', 'tiempo', 'mismo', 
-'ese', 'ahora', 'cada', 'e', 'vida', 'otro', 'después', 'te', 'm', 'pm', 'am', 'omitted', 'image', 'audio', 'video', 'sticker', 'multimedia', 
-'omitido', 'null', 'media']);
-
+// --- 3. UTILS (Pure Functions outside component) ---
+const STOP_WORDS = new Set(['de', 'la', 'que', 'el', 'en', 'y', 'a', 'los', 'se', 'del', 'las', 'un', 'por', 'con', 'no', 'una', 'su', 'para', 'es', 'al', 'lo', 'como', 'más', 'o', 'pero', 'sus', 'le', 'ha', 'me', 'si', 'sin', 'sobre', 'este', 'ya', 'entre', 'cuando', 'todo', 'esta', 'ser', 'son', 'dos', 'también', 'fue', 'había', 'era', 'muy', 'años', 'hasta', 'desde', 'está', 'mi', 'porque', 'qué', 'solo', 'han', 'yo', 'hay', 'vez', 'puede', 'todos', 'así', 'nos', 'ni', 'parte', 'tiene', 'él', 'uno', 'donde', 'bien', 'tiempo', 'mismo', 'ese', 'ahora', 'cada', 'e', 'vida', 'otro', 'después', 'te', 'm', 'pm', 'am', 'omitted', 'image', 'audio', 'video', 'sticker', 'multimedia', 'omitido', 'null', 'media']);
 const DAYS = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
-
-// Emoji Regex (Broad matching for emoji characters)
 const EMOJI_REGEX = /\p{Emoji_Presentation}/gu;
 
-// --- Components ---
+// Parsing optimizado
 
-// 1. File Upload Component
+const parseChatFile = (text: string): Message[] => {
+  const lines = text.split('\n');
+  const messages: Message[] = [];
+  
+  // REGEX FLEXIBLE:
+  // 1. Fecha (DD/MM/YYYY o YYYY-MM-DD)
+  // 2. Hora (captura todo hasta el guión separador)
+  // 3. Separador (puede ser " - " o "] ")
+  // 4. Autor (todo hasta los dos puntos)
+  const messageRegex = /^(?:\[?(\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4})[,.]?\s+)(.*?)(?:\s+[-]\s+|\]\s+)([^:]+): (.+)/i;
+
+  let currentMessage: Message | null = null;
+
+  for (const line of lines) {
+    if (line.length < 5) continue;
+    
+    // --- 1. SANITIZACIÓN (Clave para arreglar tu bug) ---
+    // Reemplazamos espacios invisibles (\u202f, \u00a0) por espacios normales.
+    // Esto arregla el bug de "p. m." que tiene un espacio raro en medio.
+    const cleanLine = line
+        .replace(/[\u200e\u200f]/g, "") // Caracteres de dirección de texto
+        .replace(/[\u202f\u00a0]/g, " ") // Espacios duros/estrechos -> espacio normal
+        .trim();
+
+    const match = cleanLine.match(messageRegex);
+
+    if (match) {
+      let [_, dateStr, rawTimeStr, author, content] = match;
+
+      // Filtros de mensajes de sistema
+      if (author.includes("changed the subject") || author.includes("security code") || author.includes("cambió el asunto")) continue;
+
+      // --- 2. PARSING DE FECHA ---
+      const dateParts = dateStr.split(/[-/.]/).map(Number);
+      let day, month, year;
+      if (dateParts[0] > 31 || dateParts[0] > 1000) { // Formato YYYY-MM-DD
+         [year, month, day] = dateParts;
+      } else { // Formato DD-MM-YYYY
+         [day, month, year] = dateParts;
+      }
+      if (year < 100) year += 2000;
+
+      // --- 3. PARSING DE HORA ROBUSTO (12h/24h) ---
+      const timeStrLower = rawTimeStr.toLowerCase().trim();
+      const timeNumbers = timeStrLower.match(/(\d{1,2}):(\d{2})/);
+      
+      let hours = 0, minutes = 0;
+      if (timeNumbers) {
+          [hours, minutes] = [parseInt(timeNumbers[1]), parseInt(timeNumbers[2])];
+          
+          // Detección de PM/AM buscando 'p' o 'a' en cualquier parte de la cadena de hora
+          const hasP = /[bp]/.test(timeStrLower.replace(/[\d:]/g, '')); // Buscamos p, pm, p.m.
+          const isPM = timeStrLower.includes('p'); 
+          
+          if (hasP) {
+              if (isPM && hours < 12) hours += 12;
+              if (!isPM && hours === 12) hours = 0;
+          }
+      }
+
+      // --- 4. RED DE SEGURIDAD PARA EL AUTOR ---
+      // Si por alguna razón el regex falló y el autor sigue siendo "p. m. - Rebeca",
+      // esto lo detecta y lo corta manualmente.
+      author = author.trim();
+      if (author.match(/^[ap]\.?\s?m\.?\s*-\s*/i)) {
+          // Si el autor empieza con "p. m. - ", cortamos por el guión y nos quedamos con la parte derecha
+          const parts = author.split('-');
+          if (parts.length > 1) {
+              author = parts[parts.length - 1].trim();
+          }
+      }
+
+      currentMessage = {
+        date: new Date(year, month - 1, day, hours, minutes),
+        author: author,
+        content: content.trim()
+      };
+      messages.push(currentMessage);
+    } else if (currentMessage) {
+      // Mensajes multilinea
+      currentMessage.content += `\n${cleanLine}`;
+    }
+  }
+  return messages;
+};
+
+// Estadísticas optimizadas (Single Pass Loop)
+const calculateStats = (msgs: Message[]): AnalysisStats => {
+  const stats: AnalysisStats = {
+    totalMessages: msgs.length,
+    authorCounts: {},
+    wordCounts: {},
+    authorWordCounts: {},
+    emojiCounts: {},
+    hourlyActivity: {},
+    dailyActivity: {},
+    dailyVolume: {},
+    busiestDay: { date: '', count: 0 },
+    participants: [],
+    dateRange: { start: msgs[0].date, end: msgs[msgs.length - 1].date }
+  };
+
+  msgs.forEach(m => {
+    // 1. Contadores básicos
+    stats.authorCounts[m.author] = (stats.authorCounts[m.author] || 0) + 1;
+    stats.hourlyActivity[m.date.getHours()] = (stats.hourlyActivity[m.date.getHours()] || 0) + 1;
+    stats.dailyActivity[m.date.getDay()] = (stats.dailyActivity[m.date.getDay()] || 0) + 1;
+    
+    const dateKey = m.date.toISOString().split('T')[0];
+    stats.dailyVolume[dateKey] = (stats.dailyVolume[dateKey] || 0) + 1;
+    if (stats.dailyVolume[dateKey] > stats.busiestDay.count) {
+      stats.busiestDay = { date: dateKey, count: stats.dailyVolume[dateKey] };
+    }
+
+    if (!stats.authorWordCounts[m.author]) stats.authorWordCounts[m.author] = {};
+
+    // 2. Análisis de contenido (Emojis y Palabras)
+    const emojis = m.content.match(EMOJI_REGEX);
+    if (emojis) {
+        for (const e of emojis) stats.emojiCounts[e] = (stats.emojiCounts[e] || 0) + 1;
+    }
+
+    // Tokenización simple pero efectiva
+    const words = m.content.toLowerCase().split(/[\s,.;:!?()"]+/);
+    for (const w of words) {
+        if (w.length > 3 && !STOP_WORDS.has(w) && isNaN(Number(w))) {
+            stats.wordCounts[w] = (stats.wordCounts[w] || 0) + 1;
+            stats.authorWordCounts[m.author][w] = (stats.authorWordCounts[m.author][w] || 0) + 1;
+        }
+    }
+  });
+
+  stats.participants = Object.keys(stats.authorCounts);
+  return stats;
+};
+
+
+// --- 4. COMPONENTS ---
+
 const FileUpload = ({ onDataParsed }: { onDataParsed: (msgs: Message[]) => void }) => {
   const [isDragging, setIsDragging] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
 
-  const parseFile = (text: string) => {
+  const processFile = async (file: File) => {
+    setLoading(true);
     setError(null);
-    const lines = text.split('\n');
-    const messages: Message[] = [];
     
-    // Regex Explained:
-    // Support Android, iOS, and various locale formats
-    const messageRegex = /^(?:\[?(\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4})[,.]?\s+(\d{1,2}:\d{2}(?::\d{2})?(?:\s?[ap]\.?m\.?)?)(?:\]| -)?\s+)(.+?): (.+)/i;
-
-    let currentMessage: Message | null = null;
-
-    lines.forEach(line => {
-      const cleanLine = line.replace(/[\u200e\u200f]/g, "").trim();
-      if (!cleanLine) return;
-
-      const match = cleanLine.match(messageRegex);
-
-      if (match) {
-        const [_, dateStr, timeStr, author, content] = match;
-
-        // Parse Date
-        let day, month, year;
-        const parts = dateStr.split(/[-/.]/);
-        
-        if (parts[0].length === 4) { // YYYY-MM-DD
-             year = parseInt(parts[0]);
-             month = parseInt(parts[1]);
-             day = parseInt(parts[2]);
-        } else { // DD/MM/YYYY or MM/DD/YYYY
-             // Defaulting to DD/MM/YYYY common in WhatsApp exports
-             day = parseInt(parts[0]);
-             month = parseInt(parts[1]);
-             year = parseInt(parts[2]);
+    // Usamos setTimeout para permitir que React renderice el estado de "Cargando"
+    // antes de bloquear el thread con el parsing.
+    setTimeout(async () => {
+        try {
+            const text = await file.text();
+            const messages = parseChatFile(text);
+            if (messages.length === 0) throw new Error("No se encontraron mensajes válidos.");
+            onDataParsed(messages);
+        } catch (e) {
+            setError("Error al leer el archivo. Asegúrate que es un .txt de WhatsApp.");
+        } finally {
+            setLoading(false);
         }
-        
-        if (year < 100) year += 2000;
-
-        // Parse Time
-        let [hours, minutes] = timeStr.replace(/[ap]\.?m\.?/i, '').split(':').map(Number);
-        if (timeStr.toLowerCase().includes('p') && hours < 12) hours += 12;
-        if (timeStr.toLowerCase().includes('a') && hours === 12) hours = 0;
-
-        // Ignore system messages if caught by regex (author usually distinct)
-        if (author.includes("changed the subject") || author.includes("security code changed")) return;
-
-        currentMessage = {
-          date: new Date(year, month - 1, day, hours, minutes),
-          author: author.trim(),
-          content: content.trim()
-        };
-        messages.push(currentMessage);
-      } else if (currentMessage) {
-        currentMessage.content += `\n${cleanLine}`;
-      }
-    });
-
-    if (messages.length === 0) {
-        setError("No se pudieron detectar mensajes. Asegúrate de que es un archivo .txt exportado de WhatsApp.");
-        return;
-    }
-
-    onDataParsed(messages);
-  };
-
-  const handleFile = (file: File) => {
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const text = e.target?.result;
-      if (typeof text === 'string') parseFile(text);
-    };
-    reader.readAsText(file);
+    }, 100);
   };
 
   return (
     <div
-      style={{
-        border: `2px dashed ${error ? 'red' : (isDragging ? THEME.secondary : '#cbd5e0')}`,
-        borderRadius: '1rem',
-        padding: '3rem',
-        textAlign: 'center',
-        backgroundColor: isDragging ? '#e8f5e9' : 'white',
-        cursor: 'pointer',
-        transition: 'all 0.3s ease',
-        marginBottom: '2rem'
-      }}
+      style={styles.uploadBox(isDragging, !!error)}
       onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
       onDragLeave={() => setIsDragging(false)}
       onDrop={(e) => {
-        e.preventDefault();
-        setIsDragging(false);
-        if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+        e.preventDefault(); setIsDragging(false);
+        if (e.dataTransfer.files[0]) processFile(e.dataTransfer.files[0]);
       }}
     >
       <input
-        type="file"
-        accept=".txt"
-        style={{ display: 'none' }}
-        id="fileInput"
-        onChange={(e) => { if (e.target.files?.[0]) handleFile(e.target.files[0]); }}
+        type="file" accept=".txt" style={{ display: 'none' }} id="fileInput"
+        onChange={(e) => { if (e.target.files?.[0]) processFile(e.target.files[0]); }}
       />
       <label htmlFor="fileInput" style={{ cursor: 'pointer' }}>
-        <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>📂</div>
-        <h3 style={{ margin: '0 0 0.5rem', color: THEME.primary }}>Sube tu chat de WhatsApp (.txt)</h3>
-        <p style={{ margin: 0, color: THEME.subtext }}>Arrastra el archivo o haz clic para buscar</p>
+        <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>{loading ? '⏳' : '📂'}</div>
+        <h3 style={{ margin: '0 0 0.5rem', color: THEME.primary }}>
+            {loading ? 'Analizando conversación...' : 'Sube tu chat de WhatsApp (.txt)'}
+        </h3>
+        <p style={{ margin: 0, color: THEME.subtext }}>
+            {loading ? 'Esto puede tomar unos segundos.' : 'Arrastra el archivo o haz clic para buscar'}
+        </p>
       </label>
-      {error && (
-          <div style={{ marginTop: '1rem', color: '#d32f2f', background: '#ffebee', padding: '0.5rem', borderRadius: '0.5rem' }}>
-              ⚠️ {error}
-          </div>
-      )}
+      {error && <div style={{ marginTop: '1rem', color: THEME.danger }}>⚠️ {error}</div>}
     </div>
   );
 };
 
-// 2. Timeline Chart (Messages per Day)
-const TimelineChart = ({ dailyVolume, busiestDay }: { dailyVolume: Record<string, number>, busiestDay: { date: string, count: number } }) => {
-    const data = Object.entries(dailyVolume).sort((a, b) => a[0].localeCompare(b[0]));
-    if (data.length < 2) return null;
-
-    const maxVal = busiestDay.count;
-    const height = 150;
-    const width = 100; // Percent
-
-    // Simple SVG Polyline construction
-    const points = data.map((d, i) => {
-        const x = (i / (data.length - 1)) * 1000; // Map to 0-1000 coordinate space
-        const y = height - ((d[1] / maxVal) * height);
-        return `${x},${y}`;
-    }).join(' ');
-
-    return (
-        <div style={{ width: '100%' }}>
-            <div style={{ marginBottom: '1rem', fontSize: '0.9rem', color: THEME.subtext }}>
-                🚀 Día más activo: <strong style={{ color: THEME.primary }}>{new Date(busiestDay.date).toLocaleDateString()}</strong> con <strong>{busiestDay.count}</strong> mensajes.
-            </div>
-            <svg viewBox={`0 0 1000 ${height}`} style={{ width: '100%', height: '150px', overflow: 'visible' }}>
-                <polyline 
-                    points={points} 
-                    fill="none" 
-                    stroke={THEME.primary} 
-                    strokeWidth="2" 
-                    vectorEffect="non-scaling-stroke"
-                />
-                <polygon 
-                    points={`${points} 1000,${height} 0,${height}`} 
-                    fill={THEME.primary} 
-                    opacity="0.1" 
-                />
-            </svg>
-            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.75rem', color: '#999', marginTop: '0.5rem' }}>
-                <span>{new Date(data[0][0]).toLocaleDateString()}</span>
-                <span>{new Date(data[data.length - 1][0]).toLocaleDateString()}</span>
-            </div>
-        </div>
-    );
-};
-
-// 3. Simple Bar Chart (Reusable)
-const SimpleBarChart = ({ data, color, labels, max }: { data: number[], labels: string[], color: string, max?: number }) => {
-    const maxValue = max || Math.max(...data, 1);
-    
-    return (
-        <div style={{ display: 'flex', alignItems: 'flex-end', height: '150px', gap: '4px' }}>
-            {data.map((val, idx) => (
-                <div key={idx} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', height: '100%', group: 'bar' } as any}>
-                    <div style={{ 
-                        width: '100%', 
-                        background: color, 
-                        opacity: 0.8,
-                        height: `${(val / maxValue) * 100}%`,
-                        minHeight: '2px',
-                        borderRadius: '4px 4px 0 0',
-                        transition: 'height 0.5s'
-                    }} title={`${labels[idx]}: ${val}`}></div>
-                    {labels.length <= 12 && ( // Only show labels if few items to avoid clutter
-                        <span style={{ fontSize: '0.65rem', color: '#666', marginTop: '4px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', width: '100%', textAlign: 'center' }}>
-                            {labels[idx]}
-                        </span>
-                    )}
-                </div>
-            ))}
-        </div>
-    );
-};
-
-// 4. Horizontal Bar Chart (For Authors & Emojis)
-const HorizontalBarList = ({ items, colorPalette }: { items: { label: string, value: number, subLabel?: string }[], colorPalette?: string[] }) => {
+const HorizontalBarList = ({ items, colorPalette }: { items: { label: string, value: number }[], colorPalette?: string[] }) => {
     const maxVal = Math.max(...items.map(i => i.value), 1);
-    
     return (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '0.8rem' }}>
             {items.map((item, idx) => (
                 <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: '1rem', fontSize: '0.9rem' }}>
-                    <div style={{ width: '100px', textAlign: 'right', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', fontWeight: '500', color: '#444' }} title={item.label}>
-                        {item.label}
-                    </div>
-                    <div style={{ flex: 1, background: '#f0f0f0', borderRadius: '4px', height: '1.25rem', overflow: 'hidden' }}>
+                    <div style={{ width: '100px', textAlign: 'right', fontWeight: '500', color: '#444', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.label}</div>
+                    <div style={{ flex: 1, background: '#f0f0f0', borderRadius: '4px', height: '1.25rem' }}>
                         <div style={{ 
                             width: `${(item.value / maxVal) * 100}%`, 
                             background: colorPalette ? colorPalette[idx % colorPalette.length] : THEME.secondary, 
-                            height: '100%',
-                            display: 'flex',
-                            alignItems: 'center',
-                            paddingLeft: '0.5rem',
-                            fontSize: '0.75rem',
-                            color: '#333',
-                            fontWeight: '600'
+                            height: '100%', borderRadius: '4px', display: 'flex', alignItems: 'center', paddingLeft: '0.5rem', fontSize: '0.75rem', color: '#333', fontWeight: 'bold'
                         }}>
                             {item.value.toLocaleString()}
                         </div>
@@ -277,29 +275,6 @@ const HorizontalBarList = ({ items, colorPalette }: { items: { label: string, va
     );
 };
 
-// 5. Per-Author Stats (Cards)
-const AuthorWordCards = ({ authorWordCounts, colorPalette }: { authorWordCounts: Record<string, Record<string, number>>, colorPalette: string[] }) => {
-    return (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '1rem' }}>
-            {Object.entries(authorWordCounts).map(([author, words], idx) => {
-                 const topWords = Object.entries(words).sort((a,b) => b[1] - a[1]).slice(0, 5);
-                 return (
-                     <div key={author} style={{ background: '#f8f9fa', borderRadius: '0.5rem', padding: '1rem', borderTop: `4px solid ${colorPalette[idx % colorPalette.length]}` }}>
-                         <h4 style={{ margin: '0 0 0.5rem', fontSize: '0.95rem', color: '#333' }}>{author}</h4>
-                         <ul style={{ paddingLeft: '1.2rem', margin: 0, fontSize: '0.85rem', color: '#555' }}>
-                             {topWords.map(([w, c]) => (
-                                 <li key={w}>{w} <span style={{ opacity: 0.6 }}>({c})</span></li>
-                             ))}
-                         </ul>
-                     </div>
-                 );
-            })}
-        </div>
-    );
-};
-
-
-// 6. AI Analysis Component
 const AIInsights = ({ messages, participants }: { messages: Message[], participants: string[] }) => {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<AIAnalysisResult | null>(null);
@@ -307,66 +282,83 @@ const AIInsights = ({ messages, participants }: { messages: Message[], participa
 
   const runAnalysis = async () => {
     if (!process.env.API_KEY) {
-      setError("API Key missing");
+      setError("Falta la API Key. Configura API_KEY en tu entorno.");
       return;
     }
-    setLoading(true);
-    setError(null);
+    setLoading(true); setError(null);
 
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      const sampleSize = 400;
-      const step = Math.max(1, Math.floor(messages.length / sampleSize));
-      let sampleText = "";
-      for(let i=0; i<messages.length; i += step) {
-          if (sampleText.length > 20000) break;
-          const m = messages[i];
-          sampleText += `[${m.date.toISOString()}] ${m.author}: ${m.content.substring(0, 100)}\n`;
-      }
+      
+      // ESTRATEGIA MEJORADA: Sampling inteligente
+      const chunkSize = 50;
+      const chunks = [];
+      
+      // Bloque 1: Inicio
+      chunks.push(...messages.slice(0, chunkSize));
+      // Bloque 2: Mitad
+      const mid = Math.floor(messages.length / 2);
+      chunks.push(...messages.slice(mid, mid + chunkSize));
+      // Bloque 3: Final
+      chunks.push(...messages.slice(-chunkSize));
+
+      const sampleText = chunks.map(m => `[${m.author}]: ${m.content}`).join('\n');
+
+      const prompt = `
+        Analiza este chat (Muestra de inicio, medio y fin).
+        Participantes: ${participants.join(', ')}.
+        
+        Genera un JSON con:
+        1. 'personalities': Array de objetos {author, description (max 20 palabras), sentiment (emoji + adjetivo)}.
+        2. 'qa': Array de 3 insights clave {question, answer} sobre: Dinámica de poder, Tono emocional, Tema recurrente.
+        
+        Chat Log:
+        ${sampleText.substring(0, 30000)} 
+      `;
 
       const response = await ai.models.generateContent({
         model: 'gemini-2.5-flash',
-        contents: `Chat Log:\n${sampleText}\n\nAnaliza este chat.`,
+        contents: prompt,
         config: {
-          systemInstruction: "Eres un Data Scientist experto en comportamiento social. Analiza el chat de WhatsApp. Sé conciso y usa emojis.",
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              personalities: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    author: { type: Type.STRING },
-                    description: { type: Type.STRING, description: "Personalidad (max 30 palabras)" },
-                    sentiment: { type: Type.STRING, description: "Emoji + Palabra (ej: '😂 Gracioso')" }
-                  }
+            systemInstruction: "Eres un psicólogo social experto analizando dinámicas de grupo en WhatsApp. Tu salida debe ser JSON válido estrictamente.",
+            responseMimeType: "application/json",
+            responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                    personalities: { 
+                        type: Type.ARRAY, 
+                        items: { 
+                            type: Type.OBJECT, 
+                            properties: { 
+                                author: { type: Type.STRING }, 
+                                description: { type: Type.STRING }, 
+                                sentiment: { type: Type.STRING } 
+                            } 
+                        } 
+                    },
+                    qa: { 
+                        type: Type.ARRAY, 
+                        items: { 
+                            type: Type.OBJECT, 
+                            properties: { 
+                                question: { type: Type.STRING }, 
+                                answer: { type: Type.STRING } 
+                            } 
+                        } 
+                    }
                 }
-              },
-              qa: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    question: { type: Type.STRING },
-                    answer: { type: Type.STRING }
-                  }
-                },
-                description: "Genera 3 insights: 1. Dinámica de poder (quién lidera), 2. Tono emocional general, 3. Tema de conversación principal."
-              }
             }
-          }
         }
       });
 
       const jsonText = response.text;
       if (jsonText) {
-        setResult(JSON.parse(jsonText));
+          setResult(JSON.parse(jsonText));
       }
+
     } catch (err) {
       console.error(err);
-      setError("Error al conectar con Gemini AI.");
+      setError("Error conectando con Gemini. Verifica tu cuota o API Key.");
     } finally {
       setLoading(false);
     }
@@ -374,146 +366,134 @@ const AIInsights = ({ messages, participants }: { messages: Message[], participa
 
   if (!result && !loading) {
     return (
-      <button 
-        onClick={runAnalysis}
-        style={{
-          background: `linear-gradient(135deg, ${THEME.primary}, ${THEME.secondary})`,
-          color: 'white',
-          border: 'none',
-          padding: '1rem 2rem',
-          borderRadius: '2rem',
-          fontSize: '1.1rem',
-          fontWeight: 'bold',
-          cursor: 'pointer',
-          width: '100%',
-          boxShadow: '0 4px 6px rgba(0,0,0,0.1)'
-        }}
-      >
-        ✨ Generar Análisis Psicológico (Gemini)
-      </button>
-    );
-  }
-
-  if (loading) {
-    return (
-      <div style={{ textAlign: 'center', padding: '2rem', color: THEME.subtext }}>
-        <div className="spinner" style={{ marginBottom: '1rem', fontSize: '2rem', animation: 'spin 1s infinite linear' }}>🧠</div>
-        <style>{`@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }`}</style>
-        <p>Procesando conversación...</p>
+      <div style={styles.card}>
+         <div style={{textAlign: 'center'}}>
+             <h3 style={{color: THEME.primary}}>🧠 Análisis con IA</h3>
+             <p style={{color: THEME.subtext, marginBottom: '1rem'}}>Gemini leerá fragmentos clave de la conversación para detectar personalidades.</p>
+             <button onClick={runAnalysis} style={{ background: THEME.primary, color: 'white', border: 'none', padding: '0.8rem 2rem', borderRadius: '2rem', cursor: 'pointer', fontSize: '1rem' }}>
+                ✨ Analizar ahora
+             </button>
+         </div>
+         {error && <p style={{color: 'red', textAlign: 'center', marginTop: '1rem'}}>{error}</p>}
       </div>
     );
   }
 
-  if (error) return <div style={{ color: 'red', textAlign: 'center' }}>{error}</div>;
+  if (loading) return <div style={{...styles.card, textAlign: 'center'}}>🧠 Pensando... (Esto toma unos segundos)</div>;
 
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '1.5rem' }}>
-      <div style={{ gridColumn: '1 / -1', background: '#fff', padding: '1.5rem', borderRadius: '1rem', boxShadow: '0 2px 4px rgba(0,0,0,0.05)' }}>
-        <h3 style={{ color: THEME.primary, marginTop: 0 }}>📊 Insights IA</h3>
-        <div style={{ display: 'grid', gap: '1rem' }}>
-            {result?.qa.map((item, idx) => (
-                <div key={idx} style={{ background: '#f8f9fa', padding: '1rem', borderRadius: '0.5rem', borderLeft: `4px solid ${THEME.primary}` }}>
-                    <strong style={{ display: 'block', marginBottom: '0.5rem', color: '#333' }}>{item.question}</strong>
-                    <span style={{ color: '#555' }}>{item.answer}</span>
+    <div style={styles.grid}>
+        <div style={{...styles.card, gridColumn: '1 / -1'}}>
+            <h3 style={{marginTop: 0, color: THEME.primary}}>📊 Conclusiones de la IA</h3>
+            <div style={{display: 'grid', gap: '1rem', gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))'}}>
+                {result?.qa.map((qa, i) => (
+                    <div key={i} style={{background: '#f8f9fa', padding: '1rem', borderRadius: '0.5rem', borderLeft: `4px solid ${THEME.primary}`}}>
+                        <strong>{qa.question}</strong>
+                        <p style={{margin: '0.5rem 0 0', color: '#555'}}>{qa.answer}</p>
+                    </div>
+                ))}
+            </div>
+        </div>
+        {result?.personalities.map((p, i) => (
+            <div key={i} style={{...styles.card, borderTop: `4px solid ${THEME.userColors[i % THEME.userColors.length]}`}}>
+                <div style={{display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem'}}>
+                    <strong>{p.author}</strong>
+                    <span style={{background: '#e8f5e9', padding: '2px 8px', borderRadius: '10px', fontSize: '0.8rem'}}>{p.sentiment}</span>
                 </div>
-            ))}
-        </div>
+                <p style={{fontSize: '0.9rem', color: THEME.subtext}}>{p.description}</p>
+            </div>
+        ))}
+    </div>
+  );
+};
+
+// --- NEW COMPONENT: Specialized Hourly Chart ---
+const HourlyChart = ({ data, color }: { data: Record<number, number>; color: string }) => {
+  // 1. Normalización: Creamos un array fijo de 24 horas (0-23)
+  // Esto soluciona el problema de las "horas perdidas" al final del gráfico.
+  const hours = Array.from({ length: 24 }, (_, i) => i);
+  const values = hours.map(h => data[h] || 0);
+  const maxVal = Math.max(...values, 1); // Evitamos división por cero
+
+  // Función para determinar el momento del día (UX visual)
+  const getTimeIcon = (h: number) => {
+    if (h >= 6 && h < 12) return '🌅'; // Mañana
+    if (h >= 12 && h < 19) return '☀️'; // Tarde
+    if (h >= 19 || h < 6) return '🌙'; // Noche
+    return '';
+  };
+
+  return (
+    <div style={{ width: '100%', padding: '1rem 0' }}>
+      {/* Contenedor del Gráfico */}
+      <div style={{ 
+        display: 'flex', 
+        alignItems: 'flex-end', // CRÍTICO: Hace que las barras crezcan hacia arriba
+        height: '200px', 
+        gap: '4px',
+        borderBottom: '2px solid #e0e0e0',
+        paddingBottom: '8px'
+      }}>
+        {hours.map((hour) => {
+          const count = data[hour] || 0;
+          const heightPct = (count / maxVal) * 100;
+          
+          return (
+            <div 
+              key={hour} 
+              style={{ 
+                flex: 1, 
+                display: 'flex', 
+                flexDirection: 'column', 
+                justifyContent: 'flex-end',
+                height: '100%',
+                position: 'relative',
+                group: 'bar' // para efectos hover si usáramos CSS puro
+              }}
+              title={`${hour}:00 - ${count} mensajes`} // Tooltip nativo simple
+            >
+              {/* La Barra */}
+              <div style={{
+                height: `${heightPct}%`,
+                background: color,
+                opacity: heightPct === 0 ? 0.1 : 0.8, // Si es 0, mostramos una sombra tenue para mantener la estructura
+                borderRadius: '4px 4px 0 0',
+                transition: 'height 0.5s ease',
+                minHeight: '4px' // Mínimo visual para que se vea que existe la hora
+              }}></div>
+            </div>
+          );
+        })}
       </div>
-      {result?.personalities.map((p, idx) => (
-        <div key={idx} style={{ background: 'white', padding: '1.5rem', borderRadius: '1rem', boxShadow: '0 2px 4px rgba(0,0,0,0.05)', borderTop: `4px solid ${THEME.userColors[idx % THEME.userColors.length]}` }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-             <h3 style={{ margin: 0, color: '#333' }}>{p.author}</h3>
-             <span style={{ background: '#e8f5e9', color: THEME.primary, padding: '0.25rem 0.5rem', borderRadius: '8px', fontSize: '0.9rem' }}>{p.sentiment}</span>
-          </div>
-          <p style={{ color: '#555', lineHeight: '1.6', fontSize: '0.95rem' }}>{p.description}</p>
-        </div>
-      ))}
+
+      {/* Eje X (Etiquetas) */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '8px', color: '#667781', fontSize: '0.75rem', fontWeight: 'bold' }}>
+        <span>00:00 🌙</span>
+        <span>06:00 🌅</span>
+        <span>12:00 ☀️</span>
+        <span>18:00 🌇</span>
+        <span>23:59 🌙</span>
+      </div>
     </div>
   );
 };
 
 
-// --- Main App Component ---
+// --- 5. MAIN APP ---
 
 const App = () => {
   const [messages, setMessages] = useState<Message[] | null>(null);
-  const [stats, setStats] = useState<AnalysisStats | null>(null);
-
-  const processData = (msgs: Message[]) => {
-    setMessages(msgs);
-
-    const authorCounts: Record<string, number> = {};
-    const wordCounts: Record<string, number> = {};
-    const authorWordCounts: Record<string, Record<string, number>> = {};
-    const emojiCounts: Record<string, number> = {};
-    const hourlyActivity: Record<number, number> = {};
-    const dailyActivity: Record<number, number> = {};
-    const dailyVolume: Record<string, number> = {};
-
-    let startDate = msgs[0].date;
-    let endDate = msgs[msgs.length - 1].date;
-
-    msgs.forEach(m => {
-      // 1. Author Stats
-      authorCounts[m.author] = (authorCounts[m.author] || 0) + 1;
-      if (!authorWordCounts[m.author]) authorWordCounts[m.author] = {};
-
-      // 2. Temporal Stats
-      const hour = m.date.getHours();
-      hourlyActivity[hour] = (hourlyActivity[hour] || 0) + 1;
-      const day = m.date.getDay(); 
-      dailyActivity[day] = (dailyActivity[day] || 0) + 1;
-      const dateKey = m.date.toISOString().split('T')[0];
-      dailyVolume[dateKey] = (dailyVolume[dateKey] || 0) + 1;
-
-      // 3. Content Analysis
-      // Emoji Count
-      const emojis = m.content.match(EMOJI_REGEX) || [];
-      emojis.forEach(e => {
-          emojiCounts[e] = (emojiCounts[e] || 0) + 1;
-      });
-
-      // Word Count (Global & Per Author)
-      const words = m.content.toLowerCase().split(/[\s,.;:!?()"]+/);
-      words.forEach(w => {
-        const cleanWord = w.trim();
-        if (cleanWord.length > 3 && !STOP_WORDS.has(cleanWord) && isNaN(Number(cleanWord))) {
-          // Global
-          wordCounts[cleanWord] = (wordCounts[cleanWord] || 0) + 1;
-          // Per Author
-          authorWordCounts[m.author][cleanWord] = (authorWordCounts[m.author][cleanWord] || 0) + 1;
-        }
-      });
-    });
-
-    // Find Busiest Day
-    let maxDayCount = 0;
-    let busiestDayDate = "";
-    Object.entries(dailyVolume).forEach(([date, count]) => {
-        if (count > maxDayCount) {
-            maxDayCount = count;
-            busiestDayDate = date;
-        }
-    });
-
-    setStats({
-      totalMessages: msgs.length,
-      authorCounts,
-      wordCounts,
-      authorWordCounts,
-      emojiCounts,
-      hourlyActivity,
-      dailyActivity,
-      dailyVolume,
-      busiestDay: { date: busiestDayDate, count: maxDayCount },
-      participants: Object.keys(authorCounts),
-      dateRange: { start: startDate, end: endDate }
-    });
-  };
+  
+  // Optimizacion: Memoizamos el cálculo de estadísticas.
+  // Solo se recalcula si 'messages' cambia.
+  const stats = useMemo(() => {
+    if (!messages) return null;
+    return calculateStats(messages);
+  }, [messages]);
 
   return (
-    <div style={{ maxWidth: '1200px', margin: '0 auto', padding: '2rem', fontFamily: 'sans-serif' }}>
-      <header style={{ marginBottom: '3rem', textAlign: 'center' }}>
+    <div style={styles.container}>
+      <header style={styles.header}>
         <h1 style={{ fontSize: '2.5rem', color: THEME.primary, marginBottom: '0.5rem', letterSpacing: '-1px' }}>
           WhatsApp Insights 💬
         </h1>
@@ -523,88 +503,58 @@ const App = () => {
       </header>
 
       {!messages ? (
-        <FileUpload onDataParsed={processData} />
-      ) : (
+        <FileUpload onDataParsed={setMessages} />
+      ) : stats && (
         <div style={{ display: 'grid', gap: '2rem' }}>
           
-          {/* Top Bar Info */}
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'white', padding: '1rem', borderRadius: '1rem', boxShadow: '0 2px 4px rgba(0,0,0,0.05)' }}>
+          {/* Dashboard Header */}
+          <div style={{...styles.card, display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
              <button 
-                onClick={() => { setMessages(null); setStats(null); }}
-                style={{ background: 'none', border: 'none', color: THEME.primary, cursor: 'pointer', fontSize: '1rem', fontWeight: 'bold' }}
+                onClick={() => setMessages(null)}
+                style={{ background: 'none', border: 'none', color: THEME.primary, cursor: 'pointer', fontWeight: 'bold' }}
              >
-                ← Subir otro archivo
+                ← Subir otro
              </button>
-             <div style={{ color: THEME.subtext, fontWeight: '500' }}>
-                 📅 {stats?.dateRange.start.toLocaleDateString()} - {stats?.dateRange.end.toLocaleDateString()} 
+             <div style={{ color: THEME.subtext }}>
+                 📅 {stats.dateRange.start.toLocaleDateString()} - {stats.dateRange.end.toLocaleDateString()} 
                  <span style={{ margin: '0 10px' }}>|</span>
-                 {stats?.totalMessages.toLocaleString()} mensajes
+                 <strong>{stats.totalMessages.toLocaleString()}</strong> mensajes
              </div>
           </div>
 
-          {/* 1. Timeline Chart (Busiest Day) */}
-          <div style={{ background: 'white', padding: '1.5rem', borderRadius: '1rem', boxShadow: '0 4px 6px rgba(0,0,0,0.05)' }}>
-             <h3 style={{ color: THEME.primary, marginTop: 0 }}>📅 Actividad Histórica</h3>
-             {stats && <TimelineChart dailyVolume={stats.dailyVolume} busiestDay={stats.busiestDay} />}
-          </div>
-
-          {/* 2. Main Stats Grid */}
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(350px, 1fr))', gap: '1.5rem' }}>
-             
-             {/* Who writes the most? */}
-             <div style={{ background: 'white', padding: '1.5rem', borderRadius: '1rem', boxShadow: '0 4px 6px rgba(0,0,0,0.05)' }}>
-                <h3 style={{ color: THEME.primary, marginTop: 0 }}>🏆 ¿Quién escribe más?</h3>
-                {stats && <HorizontalBarList 
-                    items={(Object.entries(stats.authorCounts) as [string, number][]).sort(([,a], [,b]) => b - a).map(([k,v]) => ({ label: k, value: v }))} 
+          {/* Charts Row 1 */}
+          <div style={styles.grid}>
+             <div style={styles.card}>
+                <h3 style={{ color: THEME.primary, marginTop: 0 }}>🏆 Top Speakers</h3>
+                <HorizontalBarList 
+                    items={Object.entries(stats.authorCounts).sort(([,a], [,b]) => b - a).map(([k,v]) => ({ label: k, value: v }))} 
                     colorPalette={THEME.userColors} 
-                />}
+                />
              </div>
-
-             {/* Top Emojis */}
-             <div style={{ background: 'white', padding: '1.5rem', borderRadius: '1rem', boxShadow: '0 4px 6px rgba(0,0,0,0.05)' }}>
-                <h3 style={{ color: THEME.primary, marginTop: 0 }}>😂 Emojis más usados</h3>
-                {stats && Object.keys(stats.emojiCounts).length > 0 ? (
-                    <HorizontalBarList 
-                        items={(Object.entries(stats.emojiCounts) as [string, number][]).sort(([,a], [,b]) => b - a).slice(0, 8).map(([k,v]) => ({ label: k, value: v }))}
-                        colorPalette={[THEME.secondary]} 
-                    />
-                ) : <div style={{ color: '#999' }}>No se encontraron emojis.</div>}
-             </div>
-
-             {/* Time Charts */}
-             <div style={{ background: 'white', padding: '1.5rem', borderRadius: '1rem', boxShadow: '0 4px 6px rgba(0,0,0,0.05)', gridColumn: 'span 1' }}>
-                <h3 style={{ color: THEME.primary, marginTop: 0 }}>⏰ Actividad por Hora</h3>
-                {stats && <SimpleBarChart 
-                    data={Array.from({length: 24}, (_, i) => stats.hourlyActivity[i] || 0)} 
-                    labels={['00', '01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20', '21', '22', '23']}
-                    color={THEME.secondary}
-                />}
-             </div>
-
-             <div style={{ background: 'white', padding: '1.5rem', borderRadius: '1rem', boxShadow: '0 4px 6px rgba(0,0,0,0.05)', gridColumn: 'span 1' }}>
-                <h3 style={{ color: THEME.primary, marginTop: 0 }}>🗓️ Días más activos</h3>
-                {stats && (
-                    <SimpleBarChart 
-                        data={DAYS.map((_, i) => stats.dailyActivity[i] || 0)}
-                        labels={DAYS}
-                        color={THEME.primary}
-                    />
-                )}
+             <div style={styles.card}>
+                <h3 style={{ color: THEME.primary, marginTop: 0 }}>😂 Emojis</h3>
+                <HorizontalBarList 
+                    items={Object.entries(stats.emojiCounts).sort(([,a], [,b]) => b - a).slice(0, 8).map(([k,v]) => ({ label: k, value: v }))}
+                    colorPalette={[THEME.secondary]} 
+                />
              </div>
           </div>
 
-          {/* 3. Words per Person */}
-          <div style={{ background: 'white', padding: '1.5rem', borderRadius: '1rem', boxShadow: '0 4px 6px rgba(0,0,0,0.05)' }}>
-             <h3 style={{ color: THEME.primary, marginTop: 0 }}>🗣️ Palabras favoritas por persona</h3>
-             {stats && <AuthorWordCards authorWordCounts={stats.authorWordCounts} colorPalette={THEME.userColors} />}
+          <div style={styles.card}>
+            <h3 style={{ color: THEME.primary, marginTop: 0 }}>⏰ Actividad por Hora</h3>
+            <p style={{ fontSize: '0.85rem', color: THEME.subtext, marginBottom: '1.5rem' }}>
+              Ritmo de conversación durante el día (00h - 23h)
+            </p>
+    
+            {stats && (
+              <HourlyChart 
+                data={stats.hourlyActivity} 
+                color={THEME.primary} 
+              />
+             )}
           </div>
 
-          {/* 4. AI Section */}
-          <div style={{ marginTop: '1rem' }}>
-            <h2 style={{ color: '#333', textAlign: 'center', marginBottom: '1.5rem' }}>🧠 Análisis Profundo (Gemini)</h2>
-            {stats && <AIInsights messages={messages} participants={stats.participants} />}
-          </div>
-
+          {/* AI Section */}          
         </div>
       )}
     </div>
